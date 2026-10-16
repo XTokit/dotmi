@@ -1,0 +1,22 @@
+name: Build and core checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Swift toolchain
+        run: swift --version
+      - name: Core search and index checks
+        run: zsh scripts/check.sh
+      - name: Build without installing
+        run: zsh build.sh --output /tmp/dotmi-ci/点觅.app
+      - name: Install migration and rollback checks
+        run: XUNJI_TEST_APP=/tmp/dotmi-ci/点觅.app python3 Tests/verify_install.py

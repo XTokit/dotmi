@@ -1,0 +1,36 @@
+# Local build products and application bundles
+.build/
+.swiftpm/
+dist/
+build/
+*.app/
+*.zip
+*.dmg
+*.pkg
+# Private deliveries, screenshots, runtime index and diagnostics
+交付/
+*.sqlite*
+*.db
+index-state.json
+*.ips
+*.log
+backups/
+# Local configuration and credentials
+.env
+.env.*
+*.pem
+*.p12
+*.p8
+*.key
+.DS_Store
+._*
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+
+docs/changes/
+
+docs/寻迹演示-*.png
+
+docs/点觅发布前验证-codex-2026-10-15-v1.0.md

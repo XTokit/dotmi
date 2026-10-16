@@ -1,0 +1,32 @@
+{
+  "fill": {
+    "solid": "srgb:0.98039,0.98039,0.96863,1.00000"
+  },
+  "groups": [
+    {
+      "name": "Solid monogram",
+      "specular": false,
+      "shadow": {
+        "kind": "none",
+        "opacity": 0
+      },
+      "blur-material": 0,
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      },
+      "opacity": 1,
+      "layers": [
+        {
+          "image-name": "Monogram.svg",
+          "name": "Dotmi monogram",
+          "glass": false,
+          "opacity": 1
+        }
+      ]
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}
