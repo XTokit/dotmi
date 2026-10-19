@@ -46,16 +46,29 @@ public struct SearchResult {
 
 public enum IndexError: Error, LocalizedError {
     case database(String)
-    public var errorDescription: String? { switch self { case .database(let message): return "索引数据库：\(message)" } }
+    case cancelled
+    public var errorDescription: String? { switch self { case .database(let message): return "索引数据库：\(message)"; case .cancelled: return "查询已取消" } }
+}
+
+private final class SearchCancellationProbe {
+    let cancelled: () -> Bool
+    init(_ cancelled: @escaping () -> Bool) { self.cancelled = cancelled }
 }
 
 // Each connection belongs to one serial queue. WAL lets searches run while indexing.
 public final class IndexStore {
     private var db: OpaquePointer?
+    private var countCacheKey: [String]?
+    private var countCache: [FileKind: Int] = [:]
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
     public init(path: String) throws {
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else { throw IndexError.database("无法打开索引") }
         sqlite3_busy_timeout(db, 5000)
+        sqlite3_create_function_v2(db, "xunji_stem", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nil, { context, _, values in
+            guard let context, let value = values?[0], let bytes = sqlite3_value_text(value) else { return }
+            let stem = (String(cString: bytes) as NSString).deletingPathExtension
+            stem.withCString { sqlite3_result_text(context, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+        }, nil, nil, nil)
         sqlite3_create_function_v2(db, "xunji_grams", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nil, { context, _, values in
             guard let context, let value = values?[0], let bytes = sqlite3_value_text(value) else { sqlite3_result_null(context); return }
             let result = IndexStore.grams(String(cString: bytes))
@@ -219,7 +232,14 @@ public final class IndexStore {
         let stmt = try statement("SELECT count(*) FROM files"); defer { sqlite3_finalize(stmt) }
         guard sqlite3_step(stmt) == SQLITE_ROW else { throw error() }; return Int(sqlite3_column_int64(stmt, 0))
     }
-    public func search(_ query: String, scope: String? = nil, recursive: Bool = true, includePath: Bool = false, kind: FileKind? = nil, newest: Bool = false, limit: Int = 2000, accelerated: Bool = true, includeSystemFiles: Bool = true) throws -> SearchResult {
+    public func search(_ query: String, scope: String? = nil, recursive: Bool = true, includePath: Bool = false, kind: FileKind? = nil, newest: Bool = false, limit: Int = 2000, accelerated: Bool = true, includeSystemFiles: Bool = true, relevance: Bool = false, cancelled: @escaping () -> Bool = { false }) throws -> SearchResult {
+        if cancelled() { throw IndexError.cancelled }
+        let probe = Unmanaged.passRetained(SearchCancellationProbe(cancelled))
+        sqlite3_progress_handler(db, 1000, { pointer in
+            guard let pointer else { return 0 }
+            return Unmanaged<SearchCancellationProbe>.fromOpaque(pointer).takeUnretainedValue().cancelled() ? 1 : 0
+        }, probe.toOpaque())
+        defer { sqlite3_progress_handler(db, 0, nil, nil); probe.release() }
         let start = Date()
         var clauses = ["1=1"], args: [String] = []
         if !includeSystemFiles { clauses.append("noise = 0") }
@@ -242,24 +262,45 @@ public final class IndexStore {
             } else { clauses.append("parent = ?"); args.append(scope) }
         }
         let base = clauses.joined(separator: " AND ")
-        let countsStmt = try statement("SELECT kind,count(*) FROM files WHERE \(base) GROUP BY kind")
-        bind(args, to: countsStmt)
         var counts: [FileKind: Int] = [:]
-        while true {
-            let rc = sqlite3_step(countsStmt)
-            if rc == SQLITE_DONE { break }
-            guard rc == SQLITE_ROW else { sqlite3_finalize(countsStmt); throw error() }
-            if let k = FileKind(rawValue: String(cString: sqlite3_column_text(countsStmt, 0))) { counts[k] = Int(sqlite3_column_int64(countsStmt, 1)) }
+        let versionStmt = try statement("PRAGMA data_version")
+        let versionRC = sqlite3_step(versionStmt)
+        let version = versionRC == SQLITE_ROW ? sqlite3_column_int64(versionStmt, 0) : -1
+        sqlite3_finalize(versionStmt)
+        // 其他连接提交改变 data_version，本连接写入改变 total_changes。
+        // 分类与排序不改变统计条件，索引变化后则必须重新统计，避免缓存旧数量。
+        let cacheKey = [base, String(version), String(sqlite3_total_changes(db))] + args
+        if version >= 0 && countCacheKey == cacheKey {
+            counts = countCache
+        } else {
+            let countsStmt = try statement("SELECT kind,count(*) FROM files WHERE \(base) GROUP BY kind")
+            bind(args, to: countsStmt)
+            while true {
+                let rc = sqlite3_step(countsStmt)
+                if rc == SQLITE_DONE { break }
+                guard rc == SQLITE_ROW else { sqlite3_finalize(countsStmt); if cancelled() { throw IndexError.cancelled }; throw error() }
+                if let k = FileKind(rawValue: String(cString: sqlite3_column_text(countsStmt, 0))) { counts[k] = Int(sqlite3_column_int64(countsStmt, 1)) }
+            }
+            sqlite3_finalize(countsStmt)
+            countCacheKey = version >= 0 ? cacheKey : nil
+            countCache = counts
         }
-        sqlite3_finalize(countsStmt)
         if let kind { clauses.append("kind = ?"); args.append(kind.rawValue) }
-        let order = newest ? "modified DESC,path" : "folded,path"
+        var order = newest ? "modified DESC,path" : "folded,path"
+        let phrase = Self.fold(query).split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        if relevance && !phrase.isEmpty {
+            // 在 LIMIT 之前排序，确保精确匹配不会被字母顺序截断；参数绑定保留通配符的字面语义。
+            let tokens = phrase.split(separator: " ").map(String.init)
+            let nameMatches = tokens.map { _ in "folded LIKE ? ESCAPE '\\'" }.joined(separator: " AND ")
+            order = "CASE WHEN folded = ? THEN 0 WHEN folded LIKE ? ESCAPE '\\' AND kind != 'folder' AND xunji_stem(folded) = ? THEN 1 WHEN folded LIKE ? ESCAPE '\\' THEN 2 WHEN folded LIKE ? ESCAPE '\\' THEN 3 WHEN \(nameMatches) THEN 4 ELSE 5 END, length(folded), folded, path"
+            args += [phrase, literal(phrase) + ".%", phrase, literal(phrase) + "%", "%" + literal(phrase) + "%"] + tokens.map { "%" + literal($0) + "%" }
+        }
         let stmt = try statement("SELECT path,name,kind,size,modified FROM files WHERE \(clauses.joined(separator: " AND ")) ORDER BY \(order) LIMIT \(max(1, limit))")
         defer { sqlite3_finalize(stmt) }; bind(args, to: stmt)
         var files: [FileRecord] = []
         while true {
             let rc = sqlite3_step(stmt)
-            if rc == SQLITE_DONE { break }; guard rc == SQLITE_ROW else { throw error() }
+            if rc == SQLITE_DONE { break }; guard rc == SQLITE_ROW else { if cancelled() { throw IndexError.cancelled }; throw error() }
             files.append(FileRecord(path: String(cString: sqlite3_column_text(stmt, 0)), name: String(cString: sqlite3_column_text(stmt, 1)), kind: FileKind(rawValue: String(cString: sqlite3_column_text(stmt, 2))) ?? .other, size: sqlite3_column_int64(stmt, 3), modified: sqlite3_column_double(stmt, 4)))
         }
         return SearchResult(files: files, counts: counts, total: kind.map { counts[$0, default: 0] } ?? counts.values.reduce(0,+), milliseconds: Date().timeIntervalSince(start) * 1000)

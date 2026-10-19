@@ -8,6 +8,12 @@ private enum Workbench {
     static let inset = Color(nsColor: .controlBackgroundColor)
     static let accent = Color.accentColor
     static let spacing: CGFloat = 16
+    static let shortDate: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
 }
 
 // Intent: find a local file, verify its path, then return to Finder in one action.
@@ -18,13 +24,22 @@ struct ContentView: View {
     @ObservedObject var model: SearchModel
     @AppStorage("visualStyle") private var style = "spotlight"
     @FocusState private var searchFocused: Bool
+    @FocusState private var resultListFocused: Bool
     @State private var showCoverage = false
     @State private var showFavorites = false
     @State private var coverageTab = 0
     @State private var showPermissionHelp = false
+    @State private var showSortOptions = false
+    @State private var showSearchActivity = false
+    @State private var showFilters = false
+    @State private var browseAll = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("permissionHelpDismissed") private var permissionHelpDismissed = false
     private var compact: Bool { style == "professional" || light }
     private var light: Bool { style == "spotlight" }
+    private var resultRowMinHeight: CGFloat { light ? 58 : compact ? 48 : 64 }
+    private var resultRowVerticalPadding: CGFloat { light ? 7 : compact ? 4 : 8 }
+    private var resultIconSize: CGFloat { light ? 28 : compact ? 26 : 32 }
     var body: some View {
         HStack(spacing: 0) {
             if !light { sidebar.frame(width: 204); Divider() }
@@ -32,6 +47,7 @@ struct ContentView: View {
                 searchHeader
                 Divider()
                 if model.roots.isEmpty { welcome }
+                else if model.query.isEmpty && model.kind == nil && !browseAll { quickStart }
                 else { results }
                 Divider()
                 statusBar
@@ -39,14 +55,49 @@ struct ContentView: View {
             if !light { Divider(); previewPane.frame(width: 280) }
         }
         .background(Workbench.canvas)
+        .overlay(alignment: .bottom) {
+            if let notice = model.notice {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).accessibilityHidden(true)
+                    Text(notice.message).lineLimit(2)
+                    Button { model.dismissNotice() } label: {
+                        Image(systemName: "xmark").font(.system(size: 10)).frame(width: 24, height: 24)
+                    }.buttonStyle(InteractionButtonStyle()).help("关闭提示").accessibilityLabel("关闭提示")
+                }
+                .font(.system(size: 12, weight: .medium))
+                .padding(.leading, 14).padding(.trailing, 6).padding(.vertical, 8)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.08)))
+                .shadow(color: .black.opacity(0.10), radius: 10, y: 3)
+                .padding(.horizontal, 20).padding(.bottom, 44)
+                .id(notice.id)
+                .transition(reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 5)))
+                .accessibilityLabel(notice.message)
+            }
+        }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: model.notice?.id)
         .tint(.accentColor)
         .onReceive(NotificationCenter.default.publisher(for: .init("XunjiFocusSearch"))) { _ in searchFocused = true }
+        .onReceive(NotificationCenter.default.publisher(for: .init("XunjiFocusResults"))) { _ in
+            browseAll = true
+            searchFocused = false
+            DispatchQueue.main.async { resultListFocused = true }
+        }
+        .onChange(of: searchFocused) { model.searchFieldActive = $0 }
+        .onChange(of: resultListFocused) { model.resultsActive = $0 }
+        .onChange(of: showSortOptions) { _ in model.transientPanelActive = showSortOptions || showFilters }
+        .onChange(of: showFilters) { _ in model.transientPanelActive = showSortOptions || showFilters }
+        .onChange(of: model.query) { if $0.isEmpty { browseAll = false } }
         .onAppear { searchFocused = true }
-        .sheet(item: $model.preview) { file in
-            VStack(spacing: 0) {
-                HStack { Text(file.name).font(.headline); Spacer(); Button("完成") { model.preview = nil }.keyboardShortcut(.cancelAction) }.padding()
-                QuickPreview(url: file.url).frame(minWidth: 700, minHeight: 500)
-            }
+        .onChange(of: model.scope) { path in
+            browseAll = true
+            if path == nil { model.showNotice("已返回\(model.scopeTitle)") }
+        }
+        .task(id: model.searching) {
+            showSearchActivity = false
+            guard model.searching else { return }
+            do { try await Task.sleep(nanoseconds: 220_000_000) } catch { return }
+            if model.searching { showSearchActivity = true }
         }
         .sheet(isPresented: $showCoverage) { coverage }
         .sheet(isPresented: $showFavorites) { FavoritesView(model: model) }
@@ -105,36 +156,124 @@ struct ContentView: View {
                 TextField("输入文件名关键词…", text: $model.query).textFieldStyle(.plain).font(.system(size: light ? 20 : 23, weight: .medium)).focused($searchFocused)
                     .onSubmit { model.reveal() }
                     .accessibilityLabel("搜索文件名")
+                if showSearchActivity { ProgressView().controlSize(.small).help("正在搜索本地索引") }
                 if !model.query.isEmpty { Button { model.query = ""; searchFocused = true } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary) }.buttonStyle(.plain).help("清空搜索") }
             }.padding(light ? 12 : 16).background(Workbench.inset.opacity(0.75), in: RoundedRectangle(cornerRadius: 10))
-            HStack {
-                if light { computerScopeButton }
-                Spacer()
-                if light {
-                    Button("选择文件夹…") { model.chooseFolder() }.font(.system(size: 11))
-                    favoritesMenu
-                    Toggle("子文件夹", isOn: $model.recursive).toggleStyle(.checkbox).font(.system(size: 11))
-                    Toggle("匹配路径", isOn: $model.includePath).toggleStyle(.checkbox).font(.system(size: 11))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(searchFocused ? Workbench.accent.opacity(0.65) : Color.primary.opacity(0.08), lineWidth: searchFocused ? 1.5 : 1))
+            HStack(spacing: 10) {
+                Menu {
+                    Button("整台 Mac") { browseAll = true; model.indexComputer() }
+                    Button("全部已索引位置") { browseAll = true; model.scope = nil }
+                    Divider()
+                    Button("选择文件夹…") { model.chooseFolder() }
+                    ForEach(model.favoriteFolders, id: \.self) { path in
+                        Button(URL(fileURLWithPath: path).lastPathComponent) { model.selectFolder(path) }.help(path)
+                    }
+                    Divider()
+                    if let path = model.scope {
+                        Button(model.favoriteFolders.contains(path) ? "移出常用文件夹" : "加入常用文件夹") {
+                            if model.favoriteFolders.contains(path) { model.removeFavorite(path) } else { model.addFavorite(path) }
+                        }
+                    }
+                    Button("管理常用文件夹…") { showFavorites = true }
+                    Button("索引管理…") { showCoverage = true }
+                } label: {
+                    Label("范围：\(model.scopeTitle)", systemImage: model.scope == nil ? "desktopcomputer" : "folder")
+                        .lineLimit(1).truncationMode(.middle)
                 }
+                .help(model.scope ?? "搜索全部已索引位置")
+                .accessibilityLabel("当前搜索范围：\(model.scopeTitle)")
+                if let path = model.scope {
+                    Text(URL(fileURLWithPath: path).deletingLastPathComponent().path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                        .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle).help(path)
+                }
+                Spacer(minLength: 0)
                 if !permissionHelpDismissed || !model.denied.isEmpty {
-                    Button { showPermissionHelp = true } label: { Label(model.denied.isEmpty ? "访问权限" : "部分位置无法访问", systemImage: "lock.shield") }.font(.system(size: 11)).help("查看权限说明；完成设置后可隐藏此入口")
+                    Button { showPermissionHelp = true } label: { Image(systemName: "lock.shield") }
+                        .help(model.denied.isEmpty ? "访问权限" : "部分位置无法访问，查看权限说明")
+                        .accessibilityLabel("访问权限")
                 }
-                if model.scope != nil && !light { Button("搜索整台 Mac") { model.indexComputer() }.buttonStyle(.link).font(.system(size: 11)) }
-            }
-            scopeBanner
-            HStack {
-                Toggle("显示系统与程序文件", isOn: $model.showSystemFiles)
-                    .toggleStyle(.checkbox).font(.system(size: 11))
-                    .help("显示已索引的隐藏文件、程序目录和依赖文件；已排除的目录需单独选择后建立索引。")
-                Spacer()
-            }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    typeChip(nil)
-                    ForEach(FileKind.allCases) { typeChip($0) }
+                Button { showFilters.toggle() } label: { Label(activeFilterCount == 0 ? "筛选" : "筛选 (\(activeFilterCount))", systemImage: "line.3.horizontal.decrease.circle") }
+                    .popover(isPresented: $showFilters) { filterOptions }
+            }.font(.system(size: 12)).controlSize(.regular)
+            if activeFilterCount > 0 {
+                HStack(spacing: 8) {
+                    Text([!model.recursive ? "仅当前文件夹" : nil, model.includePath ? "匹配路径" : nil, model.showSystemFiles ? "含系统与程序文件" : nil].compactMap { $0 }.joined(separator: " · "))
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("重置") { model.recursive = true; model.includePath = false; model.showSystemFiles = false }.font(.system(size: 11))
                 }
+            }
+            HStack(spacing: 6) {
+                typeChip(nil, compact: true)
+                ForEach(FileKind.allCases) { typeChip($0, compact: true) }
             }
         }.padding(light ? 16 : 20)
+    }
+    private var activeFilterCount: Int { (model.recursive ? 0 : 1) + (model.includePath ? 1 : 0) + (model.showSystemFiles ? 1 : 0) }
+    private var filterOptions: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("搜索选项").font(.headline)
+            Toggle("包含子文件夹", isOn: $model.recursive)
+            Toggle("同时匹配路径", isOn: $model.includePath)
+            Toggle("显示系统与程序文件", isOn: $model.showSystemFiles)
+            Text("显示开关只影响已索引结果；被排除的目录需单独补充索引。")
+                .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Divider()
+            Button("索引管理…") { showFilters = false; showCoverage = true }
+            Button("访问权限…") { showFilters = false; showPermissionHelp = true }
+            Button("完成") { showFilters = false }
+        }.toggleStyle(.checkbox).font(.system(size: 12)).padding(20).frame(width: 300)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .onExitCommand { showFilters = false }
+    }
+    private var quickStart: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                HStack {
+                    Text("从这里开始").font(.system(size: 14, weight: .semibold))
+                    Spacer()
+                    Button("浏览此范围全部文件") { browseAll = true }
+                }
+                Text("输入文件名关键词，按回车在 Finder 中定位。")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                HStack(spacing: 10) {
+                    Button("桌面") { model.selectFolder(NSHomeDirectory() + "/Desktop"); browseAll = true }
+                    Button("文稿") { model.selectFolder(NSHomeDirectory() + "/Documents"); browseAll = true }
+                    Button("下载") { model.selectFolder(NSHomeDirectory() + "/Downloads"); browseAll = true }
+                    Button("选择文件夹…") { model.chooseFolder() }
+                }
+                if !model.favoriteFolders.isEmpty {
+                    Text("常用文件夹").font(.system(size: 12, weight: .semibold))
+                    ForEach(model.favoriteFolders.prefix(4), id: \.self) { path in
+                        Button { model.selectFolder(path); browseAll = true } label: {
+                            Label(URL(fileURLWithPath: path).lastPathComponent, systemImage: "folder").frame(maxWidth: .infinity, alignment: .leading)
+                        }.help(path)
+                    }
+                }
+                if !model.recentFiles.isEmpty {
+                    HStack {
+                        Text("最近定位 / 打开").font(.system(size: 12, weight: .semibold))
+                        Spacer()
+                        Button("清除记录") { model.clearRecentFiles() }.font(.system(size: 11))
+                    }
+                    ForEach(model.recentFiles.prefix(6)) { file in
+                        Button { model.reveal(file) } label: {
+                            HStack {
+                                FileIcon(path: file.path).frame(width: 28, height: 28)
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text(file.name).font(.system(size: 13)).lineLimit(1)
+                                    Text(file.url.deletingLastPathComponent().path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                                        .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                                }
+                                Spacer()
+                                Image(systemName: "arrow.up.forward.square")
+                            }.frame(minHeight: 50).contentShape(Rectangle())
+                        }.buttonStyle(.plain).help("在 Finder 中定位最近使用的文件：" + file.path)
+                    }
+                }
+            }.padding(20)
+        }
     }
     private var scopeBanner: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -188,23 +327,47 @@ struct ContentView: View {
         .help("搜索全电脑可访问的文件；首次点击自动建立全盘索引")
         .accessibilityLabel("搜索整台 Mac")
     }
-    private func typeChip(_ kind: FileKind?) -> some View {
+    private func typeChip(_ kind: FileKind?, compact: Bool = false) -> some View {
         let count = kind.map { model.counts[$0, default: 0] } ?? model.counts.values.reduce(0,+)
         return Button { model.kind = kind } label: {
-            HStack(spacing: 5) { Text(kind?.title ?? "全部"); Text(count.formatted()).font(.system(size: 10)).monospacedDigit().opacity(0.65) }
-                .font(.system(size: 11, weight: model.kind == kind ? .semibold : .regular))
-                .padding(.horizontal, 10).padding(.vertical, 7)
-                .background(model.kind == kind ? Workbench.accent.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 6))
-                .foregroundStyle(model.kind == kind ? Workbench.accent : .secondary)
-        }.buttonStyle(.plain)
+            Group {
+                if compact {
+                    VStack(spacing: 2) {
+                        Text(kind?.title ?? "全部").lineLimit(1)
+                        Text(count.formatted()).font(.system(size: 10)).monospacedDigit().opacity(0.65).lineLimit(1).minimumScaleFactor(0.75)
+                    }.padding(.horizontal, 4).frame(maxWidth: .infinity, minHeight: 44)
+                } else {
+                    HStack(spacing: 5) { Text(kind?.title ?? "全部"); Text(count.formatted()).font(.system(size: 10)).monospacedDigit().opacity(0.65) }
+                        .padding(.horizontal, 12).frame(minWidth: 70, minHeight: 40)
+                }
+            }
+                .font(.system(size: 12, weight: .medium))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(FilterChipStyle(selected: model.kind == kind))
+        .accessibilityLabel("\(kind?.title ?? "全部")，\(count.formatted()) 项")
+        .accessibilityValue(model.kind == kind ? "已选中" : "未选中")
+        .help("只查看\(kind?.title ?? "全部类型")的搜索结果")
     }
     private var results: some View {
         VStack(spacing: 0) {
             HStack {
                 Text(model.total == 0 ? "搜索结果" : "找到 \(model.total.formatted()) 项").font(.system(size: 12, weight: .medium)).monospacedDigit()
                 Spacer()
-                Toggle("按类型分组", isOn: $model.grouped).toggleStyle(.checkbox).font(.system(size: 11))
-                Picker("排序", selection: $model.newest) { Text("名称排序").tag(false); Text("最近修改").tag(true) }.labelsHidden().frame(width: 100).controlSize(.small)
+                Button { showSortOptions.toggle() } label: {
+                    HStack(spacing: 8) { Text(model.sortOrder.title); Image(systemName: "chevron.down").font(.system(size: 9)) }
+                        .frame(width: 112, height: 28).contentShape(Rectangle())
+                }
+                .buttonStyle(.bordered)
+                .accessibilityLabel("排序：" + model.sortOrder.title)
+                .popover(isPresented: $showSortOptions, arrowEdge: .bottom) {
+                    SortOptionsPanel(selected: model.sortOrder, choose: { order in
+                        showSortOptions = false
+                        if model.sortOrder != order { model.sortOrder = order }
+                    }, dismiss: { showSortOptions = false })
+                        .frame(width: 190, height: 136)
+                        .background(Color(nsColor: .controlBackgroundColor))
+                }
             }.padding(.horizontal, 20).padding(.vertical, 10)
             if model.files.isEmpty {
                 VStack(spacing: 12) {
@@ -222,44 +385,48 @@ struct ContentView: View {
                     }
                 }.padding(20).frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
+                ScrollViewReader { proxy in
                 List(selection: $model.selected) {
-                    if model.grouped {
-                        ForEach(FileKind.allCases) { kind in
-                            let group = model.files.filter { $0.kind == kind }
-                            if !group.isEmpty {
-                                Section {
-                                    ForEach(group) { file in row(file).tag(file.path) }
-                                } header: {
-                                    HStack(spacing: 8) { Image(systemName: kind.symbol); Text(kind.title); Text("\(model.counts[kind, default: 0])").foregroundStyle(.secondary).monospacedDigit() }.font(.system(size: 11, weight: .semibold)).padding(.vertical, light ? 2 : 6)
-                                }
-                            }
-                        }
-                    } else { ForEach(model.files) { file in row(file).tag(file.path) } }
-                }.listStyle(.inset).environment(\.defaultMinListRowHeight, compact ? 40 : 56)
+                    ForEach(model.files) { file in row(file).tag(file.path).id(file.path) }
+                }
+                .listStyle(.inset)
+                .environment(\.defaultMinListRowHeight, resultRowMinHeight)
+                .focused($resultListFocused)
+                .onChange(of: model.selected) { path in
+                    if let path { proxy.scrollTo(path) }
+                }
+                .onChange(of: model.resultScrollReset) { _ in
+                    if let path = model.files.first?.path { proxy.scrollTo(path, anchor: .top) }
+                }
+                .onAppear { if let path = model.selected { proxy.scrollTo(path, anchor: .top) } }
+                }
             }
-            if model.total > model.files.count { Text("已显示前 \(model.files.count.formatted()) 项，共 \(model.total.formatted()) 项；输入更多关键词以缩小范围。").font(.system(size: 11)).foregroundStyle(.secondary).padding(8) }
+            if model.total > model.files.count {
+                HStack {
+                    Text("已显示 \(model.files.count.formatted()) / \(model.total.formatted()) 项").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Spacer()
+                    if model.canLoadMore { Button("继续加载 200 项") { model.loadMoreResults() }.disabled(model.searching).font(.system(size: 11)) }
+                    else { Text("输入更多关键词以缩小范围").font(.system(size: 11)).foregroundStyle(.secondary) }
+                }.padding(8)
+            }
         }.frame(maxHeight: .infinity)
     }
     private func row(_ file: FileRecord) -> some View {
-        HStack(spacing: 12) {
-            FileIcon(path: file.path).frame(width: compact ? 24 : 32, height: compact ? 24 : 32)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(file.name).font(.system(size: 13, weight: .medium)).lineLimit(1).truncationMode(.middle)
-                Text(file.url.deletingLastPathComponent().path.replacingOccurrences(of: NSHomeDirectory(), with: "~")).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-            }
-            Spacer(minLength: 4)
-            if style == "professional" { Text(Date(timeIntervalSince1970: file.modified), style: .date).font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 76, alignment: .trailing) }
-            Text(file.kind == .folder ? "—" : ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file)).font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 56, alignment: .trailing)
-            Button { model.reveal(file) } label: { Image(systemName: "arrow.up.forward.square").frame(width: 28, height: 28) }.buttonStyle(.borderless).help("在 Finder 中显示")
-        }
-        .padding(.vertical, compact ? 2 : 6).contentShape(Rectangle())
-        .onTapGesture(count: 2) { model.selected = file.path; model.reveal(file) }
-        .contextMenu {
-            Button("在 Finder 中显示") { model.reveal(file) }
-            Button("打开文件") { model.selected = file.path; model.openSelection() }
-            Button("快速预览") { model.preview = file }
-            Button("复制路径") { model.selected = file.path; model.copyPath() }
-        }
+        ResultFileRow(file: file, query: model.query, selected: model.selected == file.path,
+                      iconSize: resultIconSize, verticalPadding: resultRowVerticalPadding,
+                      onSelect: { selectResult(file) },
+                      onReveal: { selectResult(file); model.reveal(file) },
+                      onOpen: { model.selected = file.path; model.openSelection() },
+                      onPreview: { model.preview = file },
+                      onCopy: { model.selected = file.path; model.copyPath() })
+            .equatable()
+    }
+    private func selectResult(_ file: FileRecord) {
+        guard !model.searching else { return }
+        model.selected = file.path
+        // Button clicks settle their own focus after the action runs. Request the
+        // list focus on the next run-loop turn so active selection stays blue.
+        DispatchQueue.main.async { resultListFocused = true }
     }
     private var previewPane: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -284,15 +451,28 @@ struct ContentView: View {
         }.padding(20).frame(maxHeight: .infinity, alignment: .topLeading)
     }
     private func detail(_ name: String, _ value: String) -> some View { HStack(alignment: .top) { Text(name).foregroundStyle(.secondary); Spacer(); Text(value).multilineTextAlignment(.trailing) }.font(.system(size: 11)) }
+    private var indexReady: Bool {
+        model.monitoring && model.searchIndexReady && model.denied.isEmpty && !model.coverage.contains(where: { $0.state != .ready })
+    }
+    private var indexStatusText: String {
+        if model.roots.isEmpty { return "选择搜索范围" }
+        if model.indexing { return "正在更新索引…" }
+        if !model.searchIndexReady { return "正在准备检索索引…" }
+        if !model.denied.isEmpty || model.coverage.contains(where: { $0.state != .ready }) { return "部分位置需检查" }
+        if !model.monitoring { return "文件变化监测未就绪" }
+        return "已就绪"
+    }
     private var statusBar: some View {
         HStack(spacing: 8) {
             if model.indexing { ProgressView().controlSize(.mini); Button("停止") { model.stop() }.controlSize(.mini) }
-            else { Circle().fill(model.denied.isEmpty && model.monitoring && !model.coverage.contains(where: { $0.state != .ready }) ? Color.green : Color.orange).frame(width: 5, height: 5) }
-            Text(model.status).lineLimit(1)
+            else { Circle().fill(indexReady ? Color.green : Color.orange).frame(width: 5, height: 5) }
+            Button { showCoverage = true } label: {
+                Text(indexStatusText)
+                    .lineLimit(1)
+            }.buttonStyle(.plain).help(model.status + "；点击查看索引管理")
             Spacer()
-            if light { Text("↑↓ 选择 · ↵ 定位 · ⌘Y 预览").foregroundStyle(.tertiary) }
-            Text(String(format: "%.0f ms", model.milliseconds)).monospacedDigit()
-        }.font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 10)
+            if light { Text("↑↓ 选择 · ↵ 定位 · 空格预览").foregroundStyle(.secondary) }
+        }.font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 10)
     }
     private var welcome: some View {
         VStack(spacing: 18) {
@@ -394,6 +574,61 @@ struct ContentView: View {
     }
 }
 
+// 值未改变的行保留渲染结果。选中一行时，仅前后两行需要重新生成高亮与元数据。
+private struct ResultFileRow: View, Equatable {
+    let file: FileRecord
+    let query: String
+    let selected: Bool
+    let iconSize: CGFloat
+    let verticalPadding: CGFloat
+    let onSelect: () -> Void
+    let onReveal: () -> Void
+    let onOpen: () -> Void
+    let onPreview: () -> Void
+    let onCopy: () -> Void
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.file == rhs.file && lhs.query == rhs.query && lhs.selected == rhs.selected
+            && lhs.iconSize == rhs.iconSize && lhs.verticalPadding == rhs.verticalPadding
+    }
+    var body: some View {
+        HStack(spacing: 12) {
+            Button(action: onSelect) {
+                HStack(spacing: 12) {
+                    FileIcon(path: file.path).frame(width: iconSize, height: iconSize)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(filenameWithMatches(file.name, query: query, selected: selected))
+                            .font(.system(size: 13, weight: .medium)).lineLimit(1).truncationMode(.middle)
+                        Text(file.url.deletingLastPathComponent().path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                            .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    }
+                    Spacer(minLength: 4)
+                    if file.modified > 0 {
+                        Text(Workbench.shortDate.string(from: Date(timeIntervalSince1970: file.modified)))
+                            .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary).lineLimit(1)
+                            .frame(width: 76, alignment: .trailing)
+                    }
+                    Text(file.kind == .folder ? "—" : ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))
+                        .font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 56, alignment: .trailing)
+                }.contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .simultaneousGesture(TapGesture(count: 2).onEnded { _ in onReveal() })
+            Button(action: onReveal) {
+                Image(systemName: "arrow.up.forward.square").frame(width: 40, height: 40).contentShape(Rectangle())
+            }.buttonStyle(InteractionButtonStyle())
+                .help("在 Finder 中显示：\(file.name)").accessibilityLabel("在 Finder 中显示：\(file.name)")
+        }
+        .padding(.vertical, verticalPadding).contentShape(Rectangle())
+        .modifier(ResultRowHover(selected: selected)).help(file.path)
+        .contextMenu {
+            Button("在 Finder 中显示", action: onReveal)
+            Button("打开文件", action: onOpen)
+            Button("快速预览", action: onPreview)
+            Button("复制路径", action: onCopy)
+        }
+    }
+}
+
 struct QuickPreview: NSViewRepresentable {
     let url: URL
     func makeNSView(context: Context) -> PreviewContainer { PreviewContainer() }
@@ -402,12 +637,25 @@ struct QuickPreview: NSViewRepresentable {
 }
 struct FileIcon: View {
     let path: String
-    var body: some View { Image(nsImage: NSWorkspace.shared.icon(forFile: path)).resizable().interpolation(.high).scaledToFit().accessibilityHidden(true) }
+    private static let cache: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 4096
+        return cache
+    }()
+    private var icon: NSImage {
+        let key = path as NSString
+        if let cached = Self.cache.object(forKey: key) { return cached }
+        let image = NSWorkspace.shared.icon(forFile: path)
+        Self.cache.setObject(image, forKey: key)
+        return image
+    }
+    var body: some View { Image(nsImage: icon).resizable().interpolation(.high).scaledToFit().accessibilityHidden(true) }
 }
 
 struct SettingsView: View {
     @ObservedObject var model: SearchModel
     @AppStorage("visualStyle") private var style = "spotlight"
+    @AppStorage("globalHotKeyChoice") private var hotKeyChoice = GlobalHotKeyChoice.commandShift.rawValue
     @AppStorage("permissionHelpDismissed") private var permissionHelpDismissed = false
     @State private var showHelp = false
     var body: some View {
@@ -423,14 +671,22 @@ struct SettingsView: View {
             Section("搜索") {
                 Toggle("显示系统与程序文件", isOn: $model.showSystemFiles)
                 Text("关闭时收起隐藏文件、系统目录和常见程序数据。").font(.caption).foregroundStyle(.secondary)
-                LabeledContent("全局快捷键", value: "⌘ ⇧ 空格")
+                Picker("全局快捷键", selection: $hotKeyChoice) {
+                    ForEach(GlobalHotKeyChoice.allCases) { Text($0.title).tag($0.rawValue) }
+                }
+                if !model.hotKeyStatus.isEmpty { Text(model.hotKeyStatus).font(.system(size: 11)).foregroundStyle(.secondary) }
                 LabeledContent("索引数量", value: model.indexCount.formatted())
+                DisclosureGroup("响应诊断") {
+                    Text(model.responseTiming).font(.system(size: 11)).textSelection(.enabled)
+                    Text("统计截至主线程发布结果，不包含最终屏幕绘制；不会记录文件名或查询内容。")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
             }
             Section("访问权限") {
                 Toggle("在主窗口显示权限说明入口", isOn: Binding(get: { !permissionHelpDismissed }, set: { permissionHelpDismissed = !$0 }))
                 Button("打开完全磁盘访问设置") { model.openDiskAccessSettings() }
             }
-            Section("关于点觅 1.9") {
+            Section("关于点觅 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")") {
                 Text("原生 Mac 本地文件搜索 · 无需账号或付费 API").font(.caption)
                 Button("使用说明与快捷键…") { showHelp = true }
             }

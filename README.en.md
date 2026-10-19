@@ -10,33 +10,23 @@ This is a personal-project preview. Current local builds use ad hoc signing; a D
 
 - Search filenames with multiple space-separated keywords, optionally matching the full path.
 - Search accessible, non-excluded locations on your Mac, or restrict results to a folder and its subfolders.
-- Filter and group documents, images, videos, audio, folders, archives, code, and other files.
+- Filter documents, images, videos, audio, folders, archives, code, and other files.
 - Save favorite folders and reuse existing indexes when switching search scope.
 - Reveal a result in Finder, open it, use Quick Look, or copy its path.
 - Distinguish empty results caused by offline locations, access problems, exclusions, incomplete indexing, or active filters.
 - Maintain a local SQLite file-information and character-search index, with incremental updates through FSEvents.
 - Hide common hidden files and application data by default, with an option to show those already indexed.
+- Sort by relevance, name, or modification time; navigate with arrow keys, reveal with Return, and preview with Space in the result list.
+- Load 200 results initially, with more available up to 2,000; counts cover all matches. Superseded queries can be cancelled during execution.
+- Save recent files and window positions. Choose among three global shortcut combinations, with registration status in Settings.
 
 Full-text content search, OCR, pinyin search, semantic search, and automatic update downloads are not currently provided.
 
 ## Screenshots
 
-[![Dotmi search results grouped by file type, using synthetic demo files](docs/点觅-搜索与类型分组-codex-2026-10-16-v1.0.png)](docs/点觅-搜索与类型分组-codex-2026-10-16-v1.0.png)
+[![Dotmi 1.21 search and file-type filters, using synthetic demo files](docs/点觅-搜索与类型筛选-codex-2026-10-19-v1.0.png)](docs/点觅-搜索与类型筛选-codex-2026-10-19-v1.0.png)
 
-These are 2× resolution captures; click to view the full image. All filenames and paths are synthetic. The displayed search time is not a benchmark for real-world file collections.
-
-<details>
-<summary>More screenshots: document filter and folder scope</summary>
-
-**Show documents only**
-
-[![Document filter showing three synthetic documents](docs/点觅-只看文档-codex-2026-10-16-v1.0.png)](docs/点觅-只看文档-codex-2026-10-16-v1.0.png)
-
-**Search within a folder, with its current path visible**
-
-[![Folder-scoped search using synthetic data](docs/点觅-限定文件夹-codex-2026-10-16-v1.0.png)](docs/点觅-限定文件夹-codex-2026-10-16-v1.0.png)
-
-</details>
+Version 1.21 removes grouping in favor of the top category filters. Switching categories selects the first result and scrolls to the top; loading more keeps the selection. This 2× capture uses synthetic data without scanning real folders. It is not a performance benchmark or a demonstration of live file monitoring.
 
 Run `zsh scripts/demo.sh` to view the synthetic demo. It does not scan real directories or change your index and preferences. Demo files cannot actually be opened or revealed. The temporary index is removed when the demo exits.
 
@@ -73,7 +63,7 @@ Set `XUNJI_ARCH=arm64` or `XUNJI_ARCH=x86_64` to request a particular architectu
 ## First use
 
 1. Choose “整台 Mac” (Entire Mac) or a folder to build the file-information index.
-2. Enter filename keywords and narrow results by file type. Category counts cover all matches; up to 2,000 results are displayed.
+2. Enter filename keywords and narrow results by file type. Category counts cover all matches; 200 results load initially, with more available up to 2,000.
 3. Select a result and click “在 Finder 中显示选中文件” (Reveal Selected File in Finder). Use ⌘Y for Quick Look or ⌘Return to open it.
 4. “常用文件夹” (Favorite Folders) stores shortcuts without starting duplicate scans. “索引管理” (Index Management) shows coverage and skipped locations.
 

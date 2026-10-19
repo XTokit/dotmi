@@ -9,4 +9,5 @@ if [[ "${1:-}" == --integration ]]; then
   python3 Tests/verify_locations.py
   python3 Tests/verify_incremental.py
   python3 Tests/verify_preview.py
+  python3 Tests/verify_interaction.py
 fi

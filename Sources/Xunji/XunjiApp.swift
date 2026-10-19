@@ -4,11 +4,70 @@ import SearchCore
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKey: EventHotKeyRef?
+    private var hotKeyObserver: NSObjectProtocol?
+    private var registeredHotKeyChoice = ""
+    private func registerPreferredHotKey() {
+        let choice = GlobalHotKeyChoice(rawValue: UserDefaults.standard.string(forKey: "globalHotKeyChoice") ?? "") ?? .commandShift
+        guard registeredHotKeyChoice != choice.rawValue else { return }
+        if let hotKey { UnregisterEventHotKey(hotKey); self.hotKey = nil }
+        registeredHotKeyChoice = choice.rawValue
+        let modifiers: UInt32
+        switch choice {
+        case .commandShift: modifiers = UInt32(cmdKey | shiftKey)
+        case .controlOption: modifiers = UInt32(controlKey | optionKey)
+        case .commandOption: modifiers = UInt32(cmdKey | optionKey)
+        }
+        let id = EventHotKeyID(signature: 0x584A5343, id: 1)
+        let result = RegisterEventHotKey(UInt32(kVK_Space), modifiers, id, GetApplicationEventTarget(), 0, &hotKey)
+        SearchModel.shared.hotKeyStatus = result == noErr ? "已启用 " + choice.title : choice.title + " 注册失败，可能已被占用；请换一个组合或从菜单栏打开。"
+    }
     private var keyMonitor: Any?
     private var verificationTimer: Timer?
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.servicesProvider = self
+        if ProcessInfo.processInfo.arguments.contains("--verify-interaction"),
+           let directory = ProcessInfo.processInfo.environment["XUNJI_DATA_DIR"] {
+            let model = SearchModel.shared
+            let clipboard = NSPasteboard.withUniqueName()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                let path = directory + "/方案-é-👩🏽‍💻.txt"
+                try! "fixture".write(toFile: path, atomically: true, encoding: .utf8)
+                model.files = [FileRecord(path: path, name: "方案-é-👩🏽‍💻.txt", kind: .document)]
+                model.selected = path
+                model.copyPath(to: clipboard)
+                if clipboard.string(forType: .string) != path || model.notice?.message != "路径已复制" {
+                    print("Interaction diagnostic: clipboardMatches=\(clipboard.string(forType: .string) == path), notice=\(model.notice?.message ?? "nil"), issue=\(model.issue ?? "nil")")
+                    fflush(stdout)
+                }
+                precondition(clipboard.string(forType: .string) == path && model.notice?.message == "路径已复制")
+                precondition(String(filenameWithMatches("方案-é-👩🏽‍💻.txt", query: "方案 e 👩🏽‍💻", selected: false).characters) == "方案-é-👩🏽‍💻.txt")
+                model.addFavorite(directory)
+                precondition(model.notice?.message == "已加入常用文件夹")
+                model.removeFavorite(directory)
+                precondition(model.notice?.message == "已移出常用文件夹")
+                model.showNotice("旧提示", duration: 0.04)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
+                    model.showNotice("新提示", duration: 0.3)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    precondition(model.notice?.message == "新提示")
+                    model.issue = "测试错误"
+                    precondition(model.notice == nil)
+                    model.showNotice("不覆盖错误")
+                    precondition(model.notice == nil)
+                    model.issue = nil
+                    model.showNotice("自动结束", duration: 0.04)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        precondition(model.notice == nil)
+                        clipboard.releaseGlobally()
+                        print("PASS: isolated clipboard, favorite feedback, Unicode highlighting, latest notice survives old expiry, error priority and automatic dismissal")
+                        fflush(stdout); NSApp.terminate(nil)
+                    }
+                }
+            }
+            return
+        }
         if ProcessInfo.processInfo.environment["XUNJI_DEMO"] == "1", ProcessInfo.processInfo.environment["XUNJI_DATA_DIR"] != nil {
             if let output = ProcessInfo.processInfo.environment["XUNJI_DEMO_SCREENSHOT"] {
                 verificationTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] timer in
@@ -139,9 +198,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard event.window?.identifier?.rawValue == "main", event.modifierFlags.intersection([.command,.control,.option]).isEmpty else { return event }
-            if event.keyCode == 125 || event.keyCode == 126 { SearchModel.shared.moveSelection(event.keyCode == 125 ? 1 : -1); return nil }
-            if event.keyCode == 36 { SearchModel.shared.reveal(); return nil }
+            let model = SearchModel.shared
+            if event.window?.identifier?.rawValue == "file-preview",
+               event.modifierFlags.intersection([.command,.control,.option]).isEmpty {
+                switch event.keyCode {
+                case 49, 53:
+                    model.preview = nil
+                    NSApp.windows.first(where: { $0.identifier?.rawValue == "main" })?.makeKeyAndOrderFront(nil)
+                    NotificationCenter.default.post(name: .init("XunjiFocusResults"), object: nil)
+                    return nil
+                case 125, 126: model.moveSelection(event.keyCode == 125 ? 1 : -1); return nil
+                default: return event
+                }
+            }
+            guard event.window?.identifier?.rawValue == "main", event.window?.attachedSheet == nil, !model.transientPanelActive,
+                  event.modifierFlags.intersection([.command,.control,.option]).isEmpty else { return event }
+            // 组词和候选选择优先交还输入法；其他编辑控件不参与结果导航。
+            if let editor = event.window?.firstResponder as? NSTextView {
+                if editor.hasMarkedText() || !model.searchFieldActive { return event }
+            }
+            guard model.searchFieldActive || model.resultsActive else { return event }
+            if event.keyCode == 125 || event.keyCode == 126 {
+                guard !model.searching, !model.files.isEmpty else { return event }
+                if !model.searchFieldActive || model.selected == nil { model.moveSelection(event.keyCode == 125 ? 1 : -1) }
+                NotificationCenter.default.post(name: .init("XunjiFocusResults"), object: nil)
+                return nil
+            }
+            if event.keyCode == 36 { model.reveal(); return nil }
+            if event.keyCode == 49 && model.resultsActive { model.togglePreview(); return nil }
             return event
         }
         var handler: EventHandlerRef?
@@ -149,9 +233,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
             DispatchQueue.main.async { SearchModel.shared.showWindow() }; return noErr
         }, 1, &type, nil, &handler)
-        let id = EventHotKeyID(signature: 0x584A5343, id: 1)
-        let result = RegisterEventHotKey(UInt32(kVK_Space), UInt32(cmdKey | shiftKey), id, GetApplicationEventTarget(), 0, &hotKey)
-        if result != noErr { SearchModel.shared.status = "⌘⇧空格已被占用，可从菜单栏打开点觅" }
+        registerPreferredHotKey()
+        hotKeyObserver = NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in self?.registerPreferredHotKey() }
         SearchModel.shared.start()
         if ProcessInfo.processInfo.arguments.contains("--verify-index-run"),
            let reportPath = ProcessInfo.processInfo.environment["XUNJI_RUN_REPORT"],
@@ -200,6 +283,16 @@ struct XunjiApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject private var model = SearchModel.shared
     @AppStorage("visualStyle") private var style = "spotlight"
+    @AppStorage("globalHotKeyChoice") private var hotKeyChoice = GlobalHotKeyChoice.commandShift.rawValue
+    init() {
+        if ProcessInfo.processInfo.arguments.contains("--verify-interaction"),
+           ProcessInfo.processInfo.environment["XUNJI_DATA_DIR"] != nil {
+            // 只覆盖测试进程的启动域，避免断言失败后的系统窗口恢复询问；不写用户偏好。
+            var arguments = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+            arguments["ApplePersistenceIgnoreState"] = true
+            UserDefaults.standard.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+        }
+    }
     private static var menuBarIcon: NSImage {
         let image = Bundle.main.url(forResource: "MenuBarTemplate", withExtension: "png").flatMap { NSImage(contentsOf: $0) }
             ?? NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "点觅")!
@@ -218,18 +311,18 @@ struct XunjiApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("选择搜索文件夹…") { model.chooseFolder() }.keyboardShortcut("o", modifiers: [.command, .shift])
-                Button("搜索框") { NotificationCenter.default.post(name: .init("XunjiFocusSearch"), object: nil) }.keyboardShortcut("f")
+                Button("搜索框") { model.showWindow() }.keyboardShortcut("f")
             }
             CommandMenu("文件操作") {
                 Button("在 Finder 中显示") { model.reveal() }.keyboardShortcut("r").disabled(model.selection == nil)
                 Button("打开文件") { model.openSelection() }.keyboardShortcut(.return, modifiers: .command).disabled(model.selection == nil)
-                Button("快速预览") { model.preview = model.selection }.keyboardShortcut("y").disabled(model.selection == nil)
+                Button("快速预览") { model.togglePreview() }.keyboardShortcut("y").disabled(model.selection == nil)
                 Button("复制路径") { model.copyPath() }.keyboardShortcut("c", modifiers: [.command, .shift]).disabled(model.selection == nil)
             }
         }
         Settings { SettingsView(model: model).frame(width: 560, height: 480) }
         MenuBarExtra {
-            Button("打开点觅    ⌘⇧空格") { model.showWindow() }
+            Button("打开点觅    " + (GlobalHotKeyChoice(rawValue: hotKeyChoice) ?? .commandShift).title) { model.showWindow() }
             Button("搜索文件夹…") { model.chooseFolder(); model.showWindow() }
             Divider()
             Text("已索引 \(model.indexCount.formatted()) 项")

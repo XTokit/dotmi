@@ -9,6 +9,65 @@ private func XCTAssertEqual<T: Equatable>(_ actual: @autoclosure () throws -> T,
 private func XCTAssertTrue(_ value: Bool) { precondition(value) }
 
 final class IndexTests {
+    func testCancelledSearchReleasesConnection() throws {
+        let db = try store()
+        try db.upsert((0..<12000).map { FileRecord(path: "/work/item-\($0).txt", name: "item-\($0).txt", kind: .document) }, generation: "1")
+        var checks = 0
+        do {
+            _ = try db.search("item", accelerated: false, cancelled: { checks += 1; return checks > 2 })
+            fatalError("Expected an in-flight query to be cancelled")
+        } catch IndexError.cancelled { }
+        XCTAssertTrue(checks > 2)
+        XCTAssertEqual(try db.search("item", accelerated: false).total, 12000)
+        XCTAssertEqual(try db.search("item-42.txt", accelerated: false).files.first?.name, "item-42.txt")
+        try db.upsert([
+            FileRecord(path: "/work/report.draft.pdf", name: "report.draft.pdf", kind: .document),
+            FileRecord(path: "/work/report.pdf", name: "report.pdf", kind: .document),
+            FileRecord(path: "/work/project final.txt", name: "project final.txt", kind: .document),
+            FileRecord(path: "/work/final project/z.txt", name: "z.txt", kind: .document)
+        ], generation: "2")
+        XCTAssertEqual(try db.search("report", relevance: true).files.first?.name, "report.pdf")
+        XCTAssertEqual(try db.search("final project", includePath: true, relevance: true).files.first?.name, "project final.txt")
+        XCTAssertEqual(try db.search("", limit: 200).files.count, 200)
+        XCTAssertEqual(try db.search("", limit: 400).files.count, 400)
+        XCTAssertEqual(try db.search("", limit: 400).total, 12004)
+    }
+    func testCountCacheTracksBothConnections() throws {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
+        defer { for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: path + suffix) } }
+        let reader = try IndexStore(path: path)
+        let writer = try IndexStore(path: path)
+        let document = FileRecord(path: "/work/a.pdf", name: "a.pdf", kind: .document)
+        try writer.upsert([document], generation: "1")
+        XCTAssertEqual(try reader.search("", kind: .document).total, 1)
+        XCTAssertEqual(try reader.search("", kind: .image, newest: true).counts[.document], 1)
+        try writer.upsert([FileRecord(path: "/work/b.png", name: "b.png", kind: .image)], generation: "2")
+        XCTAssertEqual(try reader.search("", kind: .image).total, 1)
+        XCTAssertEqual(try reader.search("").total, 2)
+        try reader.remove(path: document.path)
+        XCTAssertEqual(try reader.search("", kind: .document).total, 0)
+        XCTAssertEqual(try reader.search("").total, 1)
+        try writer.remove(path: "/work/b.png")
+        XCTAssertEqual(try reader.search("").total, 0)
+    }
+    func testRelevanceBeforeLimitAndLiteralInput() throws {
+        let db = try store()
+        let names = ["00-notes-报告.txt", "报告草稿.txt", "报告.pdf", "报告", "报告补充.txt", "100%.txt", "1000.txt", "Café.pdf", "CAFE备忘.txt"]
+        try db.upsert(names.enumerated().map { offset, name in
+            FileRecord(path: "/work/" + name, name: name, kind: .document, modified: Double(offset))
+        } + [FileRecord(path: "/work/报告目录/aaa.txt", name: "aaa.txt", kind: .document)], generation: "1")
+        for accelerated in [false, true] {
+            if accelerated { try db.prepareSearchIndex() }
+            let result = try db.search("报告", limit: 3, accelerated: accelerated, relevance: true)
+            XCTAssertEqual(result.files.map(\.name), ["报告", "报告.pdf", "报告草稿.txt"])
+            XCTAssertEqual(result.total, 5)
+            XCTAssertEqual(try db.search("100%", relevance: true).files.map(\.name), ["100%.txt"])
+            XCTAssertEqual(try db.search("cafe", relevance: true).files.first?.name, "Café.pdf")
+            XCTAssertEqual(try db.search("报告", includePath: true, relevance: true).files.last?.name, "aaa.txt")
+            XCTAssertEqual(try db.search("报告", newest: true).files.first?.name, "报告补充.txt")
+            XCTAssertEqual(try db.search("' OR 1=1", relevance: true).total, 0)
+        }
+    }
     func testVisibilityMigrationPreservesExistingIndex() throws {
         let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
         defer { for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: path + suffix) } }
@@ -274,6 +333,9 @@ final class IndexTests {
 struct SearchChecks {
     static func main() throws {
         let tests = IndexTests()
+        try tests.testCancelledSearchReleasesConnection()
+        try tests.testCountCacheTracksBothConnections()
+        try tests.testRelevanceBeforeLimitAndLiteralInput()
         try tests.testDeletionUsesExactCaseAndFolderBoundary()
         try tests.testBatchedEventWritesAndRollback()
         tests.testEmptyResultFeedbackUsesCurrentCoverage()
@@ -289,6 +351,6 @@ struct SearchChecks {
         try tests.testCatalogStartupPolicyAndPersistence()
         try tests.testScannerReportsExcludedAndOffline()
         try tests.testHundredThousandFileSearchBenchmark()
-        print("PASS: 15 checks — coverage-aware feedback, personal file filtering, legacy schema migration, exact search equivalence, FTS migration/update/delete, restart policy, exclusion/offline reporting, 100k benchmark")
+        print("PASS: 18 checks — in-flight cancellation/reuse, paged limits, multiword/path ranking, count cache invalidation, relevance before limit, Unicode/literal ranking, coverage-aware feedback, personal file filtering, migration, restart policy, 100k benchmark")
     }
 }

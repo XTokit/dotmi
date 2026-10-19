@@ -11,6 +11,25 @@ final class Cancellation {
 }
 
 enum FolderSelectionPurpose { case search, favorite, index }
+enum GlobalHotKeyChoice: String, CaseIterable, Identifiable {
+    case commandShift, controlOption, commandOption
+    var id: String { rawValue }
+    var title: String {
+        switch self { case .commandShift: return "⌘⇧空格"; case .controlOption: return "⌃⌥空格"; case .commandOption: return "⌘⌥空格" }
+    }
+}
+enum SearchSort: String, CaseIterable, Identifiable {
+    case relevance, name, modified
+    var id: String { rawValue }
+    var title: String {
+        switch self { case .relevance: return "相关性优先"; case .name: return "名称排序"; case .modified: return "最近修改" }
+    }
+}
+
+struct InteractionNotice: Identifiable, Equatable {
+    let id = UUID()
+    let message: String
+}
 
 final class SearchModel: ObservableObject {
     static let shared = SearchModel()
@@ -32,10 +51,17 @@ final class SearchModel: ObservableObject {
         search()
     } }
     @Published var includePath = false { didSet { search() } }
-    @Published var kind: FileKind? { didSet { if kind != oldValue { selected = nil; search() } } }
-    @Published var newest = false { didSet { search() } }
-    @Published var grouped = true
-    @Published var files: [FileRecord] = []
+    @Published var kind: FileKind? { didSet { if kind != oldValue { selected = nil; resetResultsOnNextPublish = true; search(immediate: true) } } }
+    @Published var sortOrder: SearchSort = .relevance { didSet { if sortOrder != oldValue { savePreference(sortOrder.rawValue, key: "sortOrder"); search(immediate: true) } } }
+    var newest: Bool {
+        get { sortOrder == .modified }
+        set { sortOrder = newValue ? .modified : .name }
+    }
+    @Published private(set) var resultScrollReset = 0
+    private var resetResultsOnNextPublish = false
+    @Published var files: [FileRecord] = [] { didSet { navigationCache = nil } }
+    private var navigationCache: [FileRecord]?
+    @Published var hotKeyStatus = ""
     @Published var counts: [FileKind: Int] = [:]
     @Published var total = 0
     @Published var searching = false
@@ -51,15 +77,30 @@ final class SearchModel: ObservableObject {
     var indexCoverage: [RootCoverage] { coverage.filter { coveringLocation($0.path) == nil } }
     @Published var searchIndexReady = false
     @Published var upgradingSearch = false
-    @Published var issue: String?
+    @Published var issue: String? { didSet { if issue != nil { dismissNotice() } } }
+    @Published private(set) var notice: InteractionNotice?
+    private var noticeExpiry: DispatchWorkItem?
     @Published var selected: String?
-    @Published var preview: FileRecord?
+    @Published var preview: FileRecord? {
+        didSet {
+            if let preview { FilePreviewPanel.shared.show(preview) { [weak self] in self?.preview = nil } }
+            else { FilePreviewPanel.shared.hide() }
+        }
+    }
+    @Published private(set) var recentFiles: [FileRecord] = []
+    var searchFieldActive = false
+    var resultsActive = false
+    var transientPanelActive = false
     private let writer = DispatchQueue(label: "xunji.index", qos: .utility)
     private let reader = DispatchQueue(label: "xunji.search", qos: .userInitiated)
     private var readStore: IndexStore?
     private var writeStore: IndexStore?
     private var request = 0
     private var pending: DispatchWorkItem?
+    private var queryCancellation = Cancellation()
+    private var resultLimit = 200
+    private var lastIndexSearch = Date.distantPast
+    @Published private(set) var responseTiming = "尚无查询记录"
     private var cancellation = Cancellation()
     private var stream: FSEventStreamRef?
     private var changed: Set<String> = []
@@ -129,6 +170,12 @@ final class SearchModel: ObservableObject {
         }
         if testRoot == nil && ProcessInfo.processInfo.environment["XUNJI_TEST_ROOT"] == nil {
             showSystemFiles = UserDefaults.standard.bool(forKey: "showSystemFiles")
+            sortOrder = SearchSort(rawValue: UserDefaults.standard.string(forKey: "sortOrder") ?? "") ?? .relevance
+            recentFiles = (UserDefaults.standard.stringArray(forKey: "recentFiles") ?? []).prefix(12).compactMap { path in
+                guard FileManager.default.fileExists(atPath: path) else { return nil }
+                let url = URL(fileURLWithPath: path)
+                return FileRecord(path: path, name: url.lastPathComponent, kind: FileKind.classify(url, directory: url.hasDirectoryPath))
+            }
         }
         if ProcessInfo.processInfo.environment["XUNJI_DEMO"] == "1", testRoot != nil {
             configureDemo()
@@ -227,13 +274,32 @@ final class SearchModel: ObservableObject {
         for path in Set(paths).sorted(by: { $0.count < $1.count }) where !result.contains(where: { $0 == "/" || path == $0 || path.hasPrefix($0 + "/") }) { result.append(path) }
         return result
     }
-    func search() {
+    var canLoadMore: Bool { files.count < min(total, 2000) }
+    func loadMoreResults() {
+        guard !searching, canLoadMore else { return }
+        resultLimit = min(2000, resultLimit + 200)
+        search(immediate: true, expanding: true)
+    }
+    private func refreshIndexSearch() {
+        guard !searching, Date().timeIntervalSince(lastIndexSearch) >= 1 else { return }
+        lastIndexSearch = Date()
+        search(immediate: true, expanding: true)
+    }
+    func search(immediate: Bool = false, expanding: Bool = false) {
+        let submitted = ProcessInfo.processInfo.systemUptime
+        queryCancellation.cancel()
+        let cancelledQuery = Cancellation()
+        queryCancellation = cancelledQuery
+        if !expanding { resultLimit = 200 }
         request += 1; let token = request
         searching = true; searchFailure = nil
         pending?.cancel()
-        let query = query, scope = scope, recursive = recursive, includePath = includePath, kind = kind, newest = newest, showSystemFiles = showSystemFiles
+        let query = query, scope = scope, recursive = recursive, includePath = includePath, kind = kind, newest = newest, relevance = sortOrder == .relevance, showSystemFiles = showSystemFiles
+        let limit = resultLimit
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
+            guard !cancelledQuery.isCancelled else { return }
+            let started = ProcessInfo.processInfo.systemUptime
             guard let store = self.readStore else {
                 DispatchQueue.main.async {
                     guard token == self.request else { return }
@@ -242,7 +308,8 @@ final class SearchModel: ObservableObject {
                 return
             }
             do {
-                let result = try store.search(query, scope: scope, recursive: recursive, includePath: includePath, kind: kind, newest: newest, includeSystemFiles: showSystemFiles)
+                let result = try store.search(query, scope: scope, recursive: recursive, includePath: includePath, kind: kind, newest: newest, limit: limit, includeSystemFiles: showSystemFiles, relevance: relevance, cancelled: { cancelledQuery.isCancelled })
+                let completed = ProcessInfo.processInfo.systemUptime
                 DispatchQueue.main.async {
                     guard token == self.request else { return }
                     self.searching = false
@@ -250,13 +317,23 @@ final class SearchModel: ObservableObject {
                     if self.counts != result.counts { self.counts = result.counts }
                     if self.total != result.total { self.total = result.total }
                     self.milliseconds = result.milliseconds
-                    if !self.files.contains(where: { $0.path == self.selected }) {
-                        self.selected = nil
+                    self.responseTiming = String(format: "调度/排队 %.0f ms · SQL %.0f ms · 主线程等待 %.0f ms · 提交到发布 %.0f ms · %d 项", (started - submitted) * 1000, (completed - started) * 1000, (ProcessInfo.processInfo.systemUptime - completed) * 1000, (ProcessInfo.processInfo.systemUptime - submitted) * 1000, result.files.count)
+                    if self.resetResultsOnNextPublish {
+                        self.resetResultsOnNextPublish = false
+                        self.selected = self.files.first?.path
+                        self.resultScrollReset += 1
+                    } else if !self.files.contains(where: { $0.path == self.selected }) {
+                        self.selected = query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : self.orderedFiles.first?.path
                     }
                 }
-            } catch { DispatchQueue.main.async { if token == self.request { self.searching = false; self.searchFailure = error.localizedDescription; self.issue = error.localizedDescription } } }
+            } catch {
+                guard !cancelledQuery.isCancelled else { return }
+                DispatchQueue.main.async { if token == self.request { self.searching = false; self.searchFailure = error.localizedDescription; self.issue = error.localizedDescription } }
+            }
         }
-        pending = work; reader.asyncAfter(deadline: .now() + .milliseconds(90), execute: work)
+        pending = work
+        if immediate { reader.async(execute: work) }
+        else { reader.asyncAfter(deadline: .now() + .milliseconds(90), execute: work) }
     }
     func chooseFolder(purpose: FolderSelectionPurpose = .search) {
         let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
@@ -288,8 +365,14 @@ final class SearchModel: ObservableObject {
         guard FileManager.default.fileExists(atPath: path, isDirectory: &directory), directory.boolValue else { issue = "文件夹不存在或磁盘未连接。"; return }
         guard !favoriteFolders.contains(path) else { return }
         favoriteFolders.append(path); saveFavorites()
+        showNotice("已加入常用文件夹")
     }
-    func removeFavorite(_ path: String) { favoriteFolders.removeAll { $0 == path }; saveFavorites() }
+    func removeFavorite(_ input: String) {
+        let path = canonicalPath(input)
+        guard favoriteFolders.contains(path) else { return }
+        favoriteFolders.removeAll { $0 == path }; saveFavorites()
+        showNotice("已移出常用文件夹")
+    }
     func coveringLocation(_ path: String) -> String? {
         roots.filter { parent in
             guard parent != path, parent == "/" || path.hasPrefix(parent + "/"), let item = catalog.roots[parent], item.state == .ready else { return false }
@@ -312,6 +395,7 @@ final class SearchModel: ObservableObject {
             issue = "文件夹不存在或磁盘未连接。"; return
         }
         scope = path
+        showNotice("搜索范围已切换到“\(scopeTitle)”")
         pendingComputer = false; pendingFolder = nil
         scopeNotice = "已切换到所选文件夹"
         let covered = roots.contains { $0 == "/" || path == $0 || path.hasPrefix($0 + "/") }
@@ -370,7 +454,11 @@ final class SearchModel: ObservableObject {
                 for path in targets {
                     if cancel.isCancelled { break }
                     let report = try Scanner().scan(root: URL(fileURLWithPath: path), store: store, cancelled: { cancel.isCancelled }, progress: { count in
-                        DispatchQueue.main.async { self.status = "正在索引 \(path == "/" ? "整台 Mac" : URL(fileURLWithPath: path).lastPathComponent) · \(count.formatted()) 项"; self.search() }
+                        DispatchQueue.main.async {
+                            self.status = "正在索引 \(path == "/" ? "整台 Mac" : URL(fileURLWithPath: path).lastPathComponent) · \(count.formatted()) 项"
+                            let relevant = self.scope.map { $0 == path || path == "/" || $0.hasPrefix(path + "/") || path.hasPrefix($0 + "/") } ?? true
+                            if relevant { self.refreshIndexSearch() }
+                        }
                     })
                     DispatchQueue.main.async { self.mergeCoverage(path, report: report); self.saveCatalog() }
                 }
@@ -411,26 +499,77 @@ final class SearchModel: ObservableObject {
     }
     func stop() { pendingComputer = false; pendingFolder = nil; cancellation.cancel() }
     func reveal(_ file: FileRecord? = nil) {
+        guard !searching else { return }
         guard let file = file ?? selection else { return }
         guard FileManager.default.fileExists(atPath: file.path) else { issue = "文件已移动、删除或磁盘未连接。请更新索引。"; search(); return }
         NSWorkspace.shared.activateFileViewerSelecting([file.url])
+        remember(file)
     }
     func openSelection() {
         guard let file = selection else { return }
+        guard !searching else { return }
         if !NSWorkspace.shared.open(file.url) { issue = "无法打开这个文件，请检查文件是否仍存在。" }
+        else { remember(file) }
     }
-    func copyPath() { guard let path = selection?.path else { return }; NSPasteboard.general.clearContents(); NSPasteboard.general.setString(path, forType: .string) }
+    func copyPath(to pasteboard: NSPasteboard = .general) {
+        guard let path = selection?.path else { return }
+        pasteboard.clearContents()
+        if pasteboard.setString(path, forType: .string) { showNotice("路径已复制") }
+        else { issue = "未能复制路径，请重试。" }
+    }
+    func showNotice(_ message: String, duration: TimeInterval = 2.4) {
+        noticeExpiry?.cancel()
+        guard issue == nil else { return }
+        let next = InteractionNotice(message: message)
+        notice = next
+        // 连续操作以最新反馈为准，旧任务即使已排队也不能提前清除新提示。
+        let expiry = DispatchWorkItem { [weak self] in
+            guard self?.notice?.id == next.id else { return }
+            self?.notice = nil
+        }
+        noticeExpiry = expiry
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: expiry)
+    }
+    func dismissNotice() { noticeExpiry?.cancel(); noticeExpiry = nil; notice = nil }
+    private func savePreference(_ value: Any, key: String) {
+        guard ProcessInfo.processInfo.environment["XUNJI_DATA_DIR"] == nil,
+              ProcessInfo.processInfo.environment["XUNJI_TEST_ROOT"] == nil else { return }
+        UserDefaults.standard.set(value, forKey: key)
+    }
+    private func remember(_ file: FileRecord) {
+        recentFiles.removeAll { $0.path == file.path }
+        recentFiles.insert(file, at: 0)
+        recentFiles = Array(recentFiles.prefix(12))
+        savePreference(recentFiles.map(\.path), key: "recentFiles")
+    }
+    func clearRecentFiles() { recentFiles = []; savePreference([String](), key: "recentFiles") }
+    var orderedFiles: [FileRecord] {
+        if let navigationCache { return navigationCache }
+        let ordered = files
+        navigationCache = ordered
+        return ordered
+    }
+    func togglePreview() {
+        if preview != nil { preview = nil }
+        else if !searching { preview = selection }
+    }
     func moveSelection(_ delta: Int) {
-        let ordered = grouped ? FileKind.allCases.flatMap { kind in files.filter { $0.kind == kind } } : files
+        guard !searching else { return }
+        let ordered = orderedFiles
         guard !ordered.isEmpty else { return }
         let current = ordered.firstIndex { $0.path == selected } ?? (delta > 0 ? -1 : ordered.count)
         selected = ordered[min(ordered.count - 1, max(0, current + delta))].path
+        if preview != nil { preview = selection }
     }
     func resizeWindow(style: String) {
         DispatchQueue.main.async {
             guard let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "main" }) else { return }
-            window.setContentSize(style == "spotlight" ? NSSize(width: 780, height: 620) : NSSize(width: 1280, height: 820))
-            window.center()
+            let key = "DotmiWindow-" + style
+            window.setFrameAutosaveName(key)
+            if !window.setFrameUsingName(key) {
+                window.setContentSize(style == "spotlight" ? NSSize(width: 780, height: 620) : NSSize(width: 1280, height: 820))
+                window.center()
+            }
         }
     }
     func showWindow() {
